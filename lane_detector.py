@@ -48,8 +48,8 @@ class LineStringDetector:
         self._pallette = [METAINFO[i]['color'] for i in range(len(METAINFO))]
         self._id_count = 0
         self._imshow = ImageShow('images', columns=4, scale=0.6)
-        # 결과 이미지 저장 경로
-        self._post_processing_path = os.path.join(os.getcwd(), 'post_processing')
+        # 결과 이미지 저장 경로 (절대 경로 사용)
+        self._post_processing_path = os.path.abspath(os.path.join(os.getcwd(), 'post_processing'))
 
     def detect_line_strings(self):
         # data_path 내의 모든 png 이미지에 대해 처리
@@ -408,8 +408,8 @@ class LineStringDetector:
 
 
 def main():
-    npy_path = os.getenv('NPY_PATH', 'npy')
-    data_path = os.getenv('DATA_PATH', 'data')
+    npy_path = os.path.abspath(os.getenv('NPY_PATH', 'npy'))
+    data_path = os.path.abspath(os.getenv('DATA_PATH', 'data'))
     line_detector = LineStringDetector(data_path, npy_path)
     line_detector.detect_line_strings()
 
