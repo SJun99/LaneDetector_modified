@@ -4,7 +4,6 @@ import cv2
 import numpy as np
 from typing import List, Tuple
 from dataclasses import dataclass
-from skimage.feature import peak_local_max
 from scipy.interpolate import interp1d
 from show_imgs import ImageShow
 
@@ -49,7 +48,8 @@ class LineStringDetector:
         self._pallette = [METAINFO[i]['color'] for i in range(len(METAINFO))]
         self._id_count = 0
         self._imshow = ImageShow('images', columns=4, scale=0.6)
-        self._post_procssing_path = '/media/humpback/435806fd-079f-4ba1-ad80-109c8f6e2ec0/Ongoing/2025_LaneDetector/post_processing_inference'
+        # 결과 이미지 저장 경로 (절대 경로 사용)
+        self._post_processing_path = os.path.abspath(os.path.join(os.getcwd(), 'post_processing'))
 
     def detect_line_strings(self):
         # data_path 내의 모든 png 이미지에 대해 처리
@@ -88,8 +88,8 @@ class LineStringDetector:
                 line_string_list.extend(merged_lines)
 
             save_img = self._draw_class_id(save_img, line_string_list)
-            os.makedirs(self._post_procssing_path, exist_ok=True)
-            # cv2.imwrite(os.path.join(self._post_procssing_path, png_name), save_img)
+            os.makedirs(self._post_processing_path, exist_ok=True)
+            # cv2.imwrite(os.path.join(self._post_processing_path, png_name), save_img)
 
             print(f'>>>>>>>>>> line_string_list: {len(line_string_list)}')
             self._imshow.remove(['sample_points', 'ext_points'])
@@ -105,45 +105,25 @@ class LineStringDetector:
         self._imshow.show(pred_img, 'pred_img')
         return image, seg_map, pred_img
 
-    def _thin_image(self, seg_map: np.ndarray, class_id: int) -> np.ndarray:
-        '''
-        각 peak를 중심으로 7x7 영역의 median 값을 임계값으로 하여
-        해당 blob(connected component)를 flood fill한 후 thinning을 적용.
-        thin된 선은 해당 peak에 대응하는 label (k+self.id_offset)로 채워진다.
-        '''
+    def _thin_image(self, seg_map: np.ndarray, class_id: int) -> Tuple[np.ndarray, List[LineString]]:
+        """connectedComponents를 이용해 각 blob을 추출한 후 thinning을 적용한다."""
         print(f'----- [thin_image] -----')
         line_strings = []
         line_map = np.zeros_like(seg_map, dtype=np.int32)
-        line_blobs = np.zeros_like(seg_map, dtype=np.int32)
 
-        y, x = np.nonzero(seg_map)
-        self._imshow.show(seg_map * 255, 'seg_map', 1)
+        num_labels, labels = cv2.connectedComponents(seg_map.astype(np.uint8))
         fill_value = self.id_offset
-        for k, (y, x) in enumerate(zip(y, x)):
-            if line_blobs[y, x] > 0:
-                continue
-
-            # floodFill를 통해 seed가 포함된 blob을 채움
-            temp = seg_map.copy()
-            mask = np.zeros((seg_map.shape[0] + 2, seg_map.shape[1] + 2), np.uint8)
-            cv2.floodFill(temp, mask, (x, y), fill_value)
-            # 채워진 영역을 바이너리 마스크로 변환 (0 또는 255)
-            line_blobs[temp == fill_value] = fill_value
-            blob_mask = (temp == fill_value).astype(np.uint8) * 255
-
-            # cv2.ximgproc.thinning 적용 (얇은 선 추출)
-            # (cv2.ximgproc.thinning은 입력이 binary 이미지여야 함)
+        for lbl in range(1, num_labels):
+            blob_mask = (labels == lbl).astype(np.uint8) * 255
             line_img = cv2.ximgproc.thinning(blob_mask, thinningType=cv2.ximgproc.THINNING_ZHANGSUEN)
-            num_pixels = (line_img > 0).sum()
+            num_pixels = int((line_img > 0).sum())
             if num_pixels < 5:
-                print(f'[thin_image] skip small blob at ({x}, {y}), value: {fill_value}, blob size: {num_pixels}')
                 continue
-            print(f'[thin_image] fill from point at ({x}, {y}), value: {fill_value}, blob size: {num_pixels}')
-            # 결과를 line_map에 누적 (겹치는 영역은 덮어쓰기)
             line_map[line_img > 0] = fill_value
-            line_strings.append(LineString(id=fill_value, class_id=class_id, peak=(x, y)))
+            ys, xs = np.nonzero(blob_mask)
+            peak = (int(xs.mean()), int(ys.mean()))
+            line_strings.append(LineString(id=fill_value, class_id=class_id, peak=peak))
             fill_value += 1
-            vis_img = (line_map * 10).astype(np.uint8)
         return line_map, line_strings
 
     def _extend_lines(self, line_map: np.ndarray, line_strings: List[LineString]) -> List[LineString]:
@@ -153,8 +133,6 @@ class LineStringDetector:
         선 길이가 10픽셀 미만인 경우 무시.
         '''
         print(f'----- [extend_lines] -----')
-        id_list = np.unique(line_map)
-        id_list = id_list[id_list >= self.id_offset]
         for line_string in line_strings:
             # 해당 라벨만 추출한 바이너리 이미지
             line_img = (line_map == line_string.id).astype(np.uint8)
@@ -177,44 +155,24 @@ class LineStringDetector:
         return line_strings
 
     def _sample_points(self, line_img: np.ndarray, stride: int) -> np.ndarray:
-        '''
-        line_img 내의 흰색(1) 픽셀을 contour로 추출하고, 그 중 가장 긴 contour에서
-        stride 간격으로 점들을 샘플링하여 반환한다.
-        '''
-        rows, cols = np.nonzero(line_img)
-        points = np.stack((cols, rows), axis=1)
-        sorted_points = [points[0]]
-        direction = points[1] - points[0]
-        print(f'[sample_points] start point: {points[0]}, direction: {direction}')
-        sorted_points = self._sort_to_direction(points, sorted_points, True, direction, stride)
-        sorted_points = self._sort_to_direction(points, sorted_points, False, -direction, stride)
-        sorted_points = np.array(sorted_points).astype(np.int32)
-        print(f'[sample_points] sorted_points: shape: {sorted_points.shape} \n{sorted_points * 0.6}')
-        return sorted_points.astype(np.int32)
+        """contour를 따라 stride 간격으로 포인트를 샘플링한다."""
+        contours, _ = cv2.findContours(line_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if len(contours) == 0:
+            return np.empty((0, 2), dtype=np.int32)
+        contour = max(contours, key=cv2.contourArea)
+        pts = contour[:, 0, :]
+        sampled = [pts[0]]
+        dist = 0.0
+        for i in range(1, len(pts)):
+            step = np.linalg.norm(pts[i] - pts[i - 1])
+            dist += step
+            if dist >= stride:
+                sampled.append(pts[i])
+                dist = 0.0
+        if not np.array_equal(sampled[-1], pts[-1]):
+            sampled.append(pts[-1])
+        return np.array(sampled, dtype=np.int32)
 
-    def _sort_to_direction(self, src_points: np.ndarray, sorted_points: List[np.ndarray], to_tail: bool,
-                           direction: np.ndarray, stride: int) -> List[np.ndarray]:
-        points = src_points.copy()
-        while len(points) > 0:
-            last_point = sorted_points[-1] if to_tail else sorted_points[0]
-            distances = np.sqrt(np.sum((points - last_point) ** 2, axis=1))
-            dot_products = np.sum((points - last_point) * direction, axis=1)
-            valid_mask = (distances < 30) & (distances >= stride) & (dot_products >= 0)
-            if np.sum(valid_mask) == 0:
-                break
-            distances[~valid_mask] = np.inf
-            next_index = np.argmin(distances)
-            if to_tail:
-                sorted_points.append(points[next_index])
-                # print(f'[sort_to_direction] next point: {sorted_points[-1]}')
-                direction = sorted_points[-1] - last_point
-            else:
-                sorted_points.insert(0, points[next_index])
-                # print(f'[sort_to_direction] next point: {sorted_points[0]}')
-                direction = sorted_points[0] - last_point
-            distances = np.sqrt(np.sum((points - last_point) ** 2, axis=1))
-            points = points[distances >= stride]
-        return sorted_points
 
     def _extrapolate_line(self, line_string: LineString, extend_len: int, stride: int) -> LineString:
         '''
@@ -231,15 +189,14 @@ class LineStringDetector:
         total_length = s[-1]
 
         # x, y 좌표에 대해 cubic interpolation 생성
-        x_interp = interp1d(s, points[:, 0], kind='linear', fill_value="extrapolate")
-        y_interp = interp1d(s, points[:, 1], kind='linear', fill_value="extrapolate")
+        x_interp = interp1d(s, points[:, 0], kind='cubic', fill_value="extrapolate")
+        y_interp = interp1d(s, points[:, 1], kind='cubic', fill_value="extrapolate")
 
         # stride 픽셀 간격으로 새로운 s 값을 생성 (양쪽 확장)
         new_s = np.arange(-extend_len, total_length + extend_len, stride)
         ext_x = x_interp(new_s)
         ext_y = y_interp(new_s)
         ext_points = np.stack((ext_x, ext_y), axis=-1)
-        ext_points = np.clip(ext_points, 0, None)
         line_string.ext_points = np.rint(ext_points).astype(np.int32)
         # print('[extrapolate_line] points\n', points)
         print(f'[extrapolate_line] ext_points \n{ext_points * 0.6}')
@@ -319,14 +276,14 @@ class LineStringDetector:
 
     def _draw_line_strings(self, line_strings: List[LineString], extend=False):
         if extend:
-            image = np.zeros((self._img_shape[1], self._img_shape[0], 3), dtype=np.uint8)
+            image = np.zeros((self._img_shape[0], self._img_shape[1], 3), dtype=np.uint8)
             for line in line_strings:
                 if line.id is None:
                     continue
                 pts = line.ext_points.reshape((-1, 1, 2))
                 cv2.polylines(image, [pts], isClosed=False, color=(line.id, line.id, line.id), thickness=2)
         else:
-            image = np.zeros((self._img_shape[1], self._img_shape[0], 3), dtype=np.uint8)
+            image = np.zeros((self._img_shape[0], self._img_shape[1], 3), dtype=np.uint8)
             for line in line_strings:
                 if line.id is None:
                     continue
@@ -335,7 +292,7 @@ class LineStringDetector:
         return image
 
     def _draw_line_strings_color(self, line_strings: List[LineString]):
-        image = np.zeros((self._img_shape[1], self._img_shape[0], 3), dtype=np.uint8)
+        image = np.zeros((self._img_shape[0], self._img_shape[1], 3), dtype=np.uint8)
         for line in line_strings:
             if line.id is None:
                 continue
@@ -344,7 +301,7 @@ class LineStringDetector:
         return image
 
     def _draw_line_peaks(self, line_strings: List[LineString]):
-        image = np.zeros((self._img_shape[1], self._img_shape[0]), dtype=np.uint8)
+        image = np.zeros((self._img_shape[0], self._img_shape[1]), dtype=np.uint8)
         for line in line_strings:
             if line is None or line.id is None:
                 continue
@@ -451,8 +408,8 @@ class LineStringDetector:
 
 
 def main():
-    npy_path = '/media/humpback/435806fd-079f-4ba1-ad80-109c8f6e2ec0/Ongoing/2025_LaneDetector/mask2former'
-    data_path = '/home/humpback/youn_ws/LaneDetector_rilab/dataset/mask2former'
+    npy_path = os.path.abspath(os.getenv('NPY_PATH', 'npy'))
+    data_path = os.path.abspath(os.getenv('DATA_PATH', 'data'))
     line_detector = LineStringDetector(data_path, npy_path)
     line_detector.detect_line_strings()
 
